@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsApp Lydia Pro",
+  "short_name": "WALydia",
+  "description": "Solução avançada para captura e gestão de mensagens do WhatsApp Web integrado a CRM",
+  "version": "1.0.0",
+  "version_name": "1.0.0",
+  "permissions": [
+      "activeTab",
+      "storage",
+      "notifications",
+      "scripting"
+  ],
+  "icons": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+  },
+  "background": {
+      "service_worker": "background.js",
+      "type": "module"
+  },
+  "content_scripts": [
+      {
+          "matches": ["https://web.whatsapp.com/*"],
+          "js": ["content.js"],
+          "run_at": "document_idle",
+          "all_frames": false
+      }
+  ],
+  "action": {
+      "default_popup": "popup/popup.html",
+      "default_title": "WhatsApp Lydia",
+      "default_icon": {
+          "16": "icons/icon16.png",
+          "24": "icons/icon24.png",
+          "32": "icons/icon32.png"
+      }
+  },
+  "host_permissions": [
+      "https://web.whatsapp.com/*"
+  ],
+  "web_accessible_resources": [{
+      "resources": [
+          "assets/*",
+          "lib/*"
+      ],
+      "matches": ["https://web.whatsapp.com/*"]
+  }],
+  "commands": {
+      "_execute_action": {
+          "suggested_key": {
+              "default": "Ctrl+Shift+L",
+              "mac": "Command+Shift+L"
+          },
+          "description": "Abre a interface da extensão"
+      }
+  }
+}
