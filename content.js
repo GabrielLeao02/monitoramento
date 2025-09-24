@@ -49,6 +49,7 @@ function captureMessages() {
         log("DEBUG", "STATE", `sentMessageIds salvo (${set.size} itens)`);
     };
     let sentMessages = getSentMessages();
+    const pendingMessageIds = new Set();
 
     // ======== AUTH ========
     const loginAndGetToken = async (email, password) => {
@@ -283,34 +284,50 @@ function captureMessages() {
     };
 
     // ======== API ========
-    const sendBatchToAPI = (messages) => {
+    const sendBatchToAPI = async (messages) => {
         const { selector } = findChatContainer();
         group("API", `📤 Enviando lote (${messages.length}) | root=${selector}`);
         log("DEBUG","API","Payload (amostra até 3)", messages.slice(0,3));
-        fetch('https://apilydia.lydia.com.br/crmlydia/message', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + lydiaToken },
-            body: JSON.stringify(messages)
-        })
-            .then(async res => {
-                log("INFO","API",`Resposta da API status: ${res.status}`);
-                const raw = await res.text();
-                try {
-                    const data = JSON.parse(raw);
-                    log("DEBUG","API","JSON parseado", data);
-                    if (data?.data?.status === 2 && data?.data?.phone) {
-                        blockedNumbers.add(data.data.phone);
-                        log("WARN","API",`🛑 Número bloqueado por status 2: ${data.data.phone}`);
-                    }
-                    log("INFO","API","✅ Lote enviado com sucesso");
-                } catch { log("WARN","API","⚠️ Resposta inesperada (não-JSON)", raw); }
-            })
-            .catch(error => log("ERROR","API","❌ Erro ao enviar lote", error))
-            .finally(() => groupEnd());
+
+        try {
+            const res = await fetch('https://apilydia.lydia.com.br/crmlydia/message', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + lydiaToken },
+                body: JSON.stringify(messages)
+            });
+
+            log("INFO","API",`Resposta da API status: ${res.status}`);
+            const raw = await res.text();
+            let data = null;
+            try {
+                data = JSON.parse(raw);
+                log("DEBUG","API","JSON parseado", data);
+            } catch {
+                log("WARN","API","⚠️ Resposta inesperada (não-JSON)", raw);
+            }
+
+            if (data?.data?.status === 2 && data?.data?.phone) {
+                blockedNumbers.add(data.data.phone);
+                log("WARN","API",`🛑 Número bloqueado por status 2: ${data.data.phone}`);
+            }
+
+            if (!res.ok) {
+                log("WARN","API","❌ Lote não aceito pela API", { status: res.status, body: raw });
+                return false;
+            }
+
+            log("INFO","API","✅ Lote enviado com sucesso");
+            return true;
+        } catch (error) {
+            log("ERROR","API","❌ Erro ao enviar lote", error);
+            return false;
+        } finally {
+            groupEnd();
+        }
     };
 
     // ======== CAPTURA (últimas 24h) ========
-    const buildPayloadFromMessage = async (msg, now, windowStart, skipped) => {
+    const buildPayloadFromMessage = async (msg, now, windowStart, skipped, batchIds) => {
         const messageText = msg.innerText?.trim() || '';
         const imageEntries = findImageElementsInMessage(msg);
         const hasText = !!messageText;
@@ -328,25 +345,23 @@ function captureMessages() {
         const dataId = container?.getAttribute('data-id')
             || `${messageText}-${time.toISOString()}-${sentByMe ? 'you' : 'them'}`;
 
-        if (sentMessages.has(dataId)) { skipped.duplicate++; return null; }
+        if (sentMessages.has(dataId) || pendingMessageIds.has(dataId) || batchIds.has(dataId)) {
+            skipped.duplicate++;
+            return null;
+        }
 
         if (time < windowStart || time > now) {
-            sentMessages.add(dataId);
             skipped.outOfWindow++;
             return null;
         }
 
-        sentMessages.add(dataId);
-
         let media = [];
         if (hasImages) {
             media = await collectImageAttachments(imageEntries);
-            if (media.length === 0 && !hasText) {
-                sentMessages.delete(dataId);
-                skipped.empty++;
-                return null;
-            }
+            if (media.length === 0 && !hasText) { skipped.empty++; return null; }
         }
+
+        batchIds.add(dataId);
 
         const payload = {
             email: currentEmail,
@@ -374,16 +389,33 @@ function captureMessages() {
         const twentyFourHoursAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
         const payloadList = [];
         const skipped = { empty:0, invalidTime:0, blocked:0, duplicate:0, outOfWindow:0 };
+        const batchIds = new Set();
+        const newMessageIds = [];
 
         for (const msg of all) {
-            const payload = await buildPayloadFromMessage(msg, now, twentyFourHoursAgo, skipped);
-            if (payload) payloadList.push(payload);
+            const payload = await buildPayloadFromMessage(msg, now, twentyFourHoursAgo, skipped, batchIds);
+            if (payload) {
+                payloadList.push(payload);
+                newMessageIds.push(payload.messageId);
+                pendingMessageIds.add(payload.messageId);
+            }
         }
 
         log("INFO","CAPTURE",`Payload pronto: ${payloadList.length}`);
         log("DEBUG","CAPTURE","Estatísticas de descarte", skipped);
-        saveSentMessages(sentMessages);
-        if (payloadList.length > 0) sendBatchToAPI(payloadList);
+        if (payloadList.length > 0) {
+            const success = await sendBatchToAPI(payloadList);
+            if (success) {
+                newMessageIds.forEach(id => {
+                    pendingMessageIds.delete(id);
+                    sentMessages.add(id);
+                });
+                saveSentMessages(sentMessages);
+            } else {
+                newMessageIds.forEach(id => pendingMessageIds.delete(id));
+                log("WARN","CAPTURE","Lote não enviado; mensagens removidas da fila pendente", { count: newMessageIds.length });
+            }
+        }
         groupEnd();
     };
 
@@ -406,6 +438,8 @@ function captureMessages() {
                 const twentyFourHoursAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
                 const payloadList = [];
                 const skipped = { empty:0, invalidTime:0, blocked:0, duplicate:0, outOfWindow:0 };
+                const batchIds = new Set();
+                const newMessageIds = [];
                 let seen = 0;
 
                 for (const mutation of mutations) {
@@ -419,16 +453,31 @@ function captureMessages() {
 
                         for (const msg of elements) {
                             seen++;
-                            const payload = await buildPayloadFromMessage(msg, now, twentyFourHoursAgo, skipped);
-                            if (payload) payloadList.push(payload);
+                            const payload = await buildPayloadFromMessage(msg, now, twentyFourHoursAgo, skipped, batchIds);
+                            if (payload) {
+                                payloadList.push(payload);
+                                newMessageIds.push(payload.messageId);
+                                pendingMessageIds.add(payload.messageId);
+                            }
                         }
                     }
                 }
 
                 log("INFO","OBSERVER",`Mutations processadas: ${seen} → payload ${payloadList.length}`);
                 log("DEBUG","OBSERVER","Estatísticas de descarte", skipped);
-                saveSentMessages(sentMessages);
-                if (payloadList.length > 0) sendBatchToAPI(payloadList);
+                if (payloadList.length > 0) {
+                    const success = await sendBatchToAPI(payloadList);
+                    if (success) {
+                        newMessageIds.forEach(id => {
+                            pendingMessageIds.delete(id);
+                            sentMessages.add(id);
+                        });
+                        saveSentMessages(sentMessages);
+                    } else {
+                        newMessageIds.forEach(id => pendingMessageIds.delete(id));
+                        log("WARN","OBSERVER","Lote não enviado; mensagens removidas da fila pendente", { count: newMessageIds.length });
+                    }
+                }
             };
 
             processMutations().catch(error => log("ERROR","OBSERVER","Erro ao processar mutations", error));
@@ -481,7 +530,11 @@ function captureMessages() {
 
     window.addEventListener('beforeunload', () => {
         log("INFO","INIT","Página descarregando. Salvando estado...");
-        saveSentMessages(sentMessages);
+        if (pendingMessageIds.size === 0) {
+            saveSentMessages(sentMessages);
+        } else {
+            log("WARN","INIT",`Pulando persistência: ${pendingMessageIds.size} mensagens pendentes`);
+        }
         if (observer) observer.disconnect();
     });
 
