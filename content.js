@@ -194,6 +194,94 @@ function captureMessages() {
         } catch { return null; }
     };
 
+    const formatDateTime = (time) => `${String(time.getDate()).padStart(2, '0')}/${String(time.getMonth() + 1).padStart(2, '0')}/${time.getFullYear()} ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+
+    const arrayBufferToBase64 = (buffer) => {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            const chunk = bytes.subarray(i, i + chunkSize);
+            binary += String.fromCharCode.apply(null, chunk);
+        }
+        return btoa(binary);
+    };
+
+    const dataUrlToMedia = (src) => {
+        try {
+            const match = src.match(/^data:(.+);base64,(.+)$/);
+            if (!match) return null;
+            const [, mimeType, base64] = match;
+            return { mimeType: mimeType || 'application/octet-stream', base64 };
+        } catch (error) {
+            log("WARN", "MEDIA", "Falha ao converter data URL em base64", error);
+            return null;
+        }
+    };
+
+    const fetchMediaAsBase64 = async (src) => {
+        try {
+            const response = await fetch(src);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const blob = await response.blob();
+            const buffer = await blob.arrayBuffer();
+            return {
+                mimeType: blob.type || 'application/octet-stream',
+                base64: arrayBufferToBase64(buffer)
+            };
+        } catch (error) {
+            log("WARN", "MEDIA", "Falha ao buscar mídia para base64", { src, error });
+            return null;
+        }
+    };
+
+    const findImageElementsInMessage = (msg) => {
+        const container = msg.closest('[data-id]') || msg;
+        if (!container) return [];
+        const candidates = Array.from(container.querySelectorAll('img'));
+        const results = [];
+        const seenSrc = new Set();
+        candidates.forEach(img => {
+            const src = img.getAttribute('src') || '';
+            if (!src) return;
+            if (seenSrc.has(src)) return;
+            const testId = (img.getAttribute('data-testid') || '').toLowerCase();
+            if (testId.includes('emoji') || testId.includes('sticker') || testId.includes('avatar')) return;
+            if (img.closest('[data-testid="quoted-message"]')) return;
+            if (img.closest('[data-testid="chatlist-profile-picture"]') || img.closest('[data-testid="avatar"]')) return;
+            const alt = img.getAttribute('alt') || '';
+            const isBlobOrData = src.startsWith('blob:') || src.startsWith('data:');
+            const isWhatsappMedia = src.includes('mmg.whatsapp.net') || src.includes('media.whatsapp.net');
+            const flaggedByTestId = testId.includes('image') || !!img.closest('[data-testid*="image"]');
+            if (!isBlobOrData && !isWhatsappMedia && !flaggedByTestId) return;
+            if (!flaggedByTestId && alt.length > 0 && alt.length <= 2) return;
+            seenSrc.add(src);
+            results.push({ img, src });
+        });
+        return results;
+    };
+
+    const collectImageAttachments = async (imageEntries) => {
+        const attachments = [];
+        for (const { img, src } of imageEntries) {
+            let mediaData = null;
+            if (src.startsWith('data:')) {
+                mediaData = dataUrlToMedia(src);
+            } else {
+                mediaData = await fetchMediaAsBase64(src);
+            }
+            if (!mediaData) continue;
+            if (mediaData.mimeType === 'image/svg+xml') continue;
+            attachments.push({
+                type: 'image',
+                mimeType: mediaData.mimeType,
+                base64: mediaData.base64,
+                name: img.getAttribute('alt') || null
+            });
+        }
+        return attachments;
+    };
+
     // ======== API ========
     const sendBatchToAPI = (messages) => {
         const { selector } = findChatContainer();
@@ -222,10 +310,64 @@ function captureMessages() {
     };
 
     // ======== CAPTURA (últimas 24h) ========
-    const captureMessagesFromLast24Hours = () => {
+    const buildPayloadFromMessage = async (msg, now, windowStart, skipped) => {
+        const messageText = msg.innerText?.trim() || '';
+        const imageEntries = findImageElementsInMessage(msg);
+        const hasText = !!messageText;
+        const hasImages = imageEntries.length > 0;
+        if (!hasText && !hasImages) { skipped.empty++; return null; }
+
+        const sentByMe = msg.closest(".message-out") !== null;
+        const time = parseWhatsAppTime(msg);
+        if (!time) { skipped.invalidTime++; return null; }
+
+        const senderNumber = getSenderNumber(msg);
+        if (senderNumber && blockedNumbers.has(senderNumber)) { skipped.blocked++; return null; }
+
+        const container = msg.closest('[data-id]');
+        const dataId = container?.getAttribute('data-id')
+            || `${messageText}-${time.toISOString()}-${sentByMe ? 'you' : 'them'}`;
+
+        if (sentMessages.has(dataId)) { skipped.duplicate++; return null; }
+
+        if (time < windowStart || time > now) {
+            sentMessages.add(dataId);
+            skipped.outOfWindow++;
+            return null;
+        }
+
+        sentMessages.add(dataId);
+
+        let media = [];
+        if (hasImages) {
+            media = await collectImageAttachments(imageEntries);
+            if (media.length === 0 && !hasText) {
+                sentMessages.delete(dataId);
+                skipped.empty++;
+                return null;
+            }
+        }
+
+        const payload = {
+            email: currentEmail,
+            phone: getPhoneNumber(),
+            sender: senderNumber,
+            idPeople: peopleId,
+            messageId: dataId,
+            dateTime: formatDateTime(time),
+            incoming: sentByMe ? 0 : 1,
+            message: messageText,
+            type: media.length > 0 ? 'image' : 'text'
+        };
+
+        if (media.length > 0) payload.media = media;
+        return payload;
+    };
+
+    const captureMessagesFromLast24Hours = async () => {
         const { selector } = findChatContainer();
         group("CAPTURE", `📥 Capturando últimas 24h | root=${selector}`);
-        const all = document.querySelectorAll(".copyable-text[data-pre-plain-text]");
+        const all = Array.from(document.querySelectorAll(".copyable-text[data-pre-plain-text]"));
         log("INFO","CAPTURE",`Mensagens no DOM: ${all.length}`);
 
         const now = new Date();
@@ -233,31 +375,10 @@ function captureMessages() {
         const payloadList = [];
         const skipped = { empty:0, invalidTime:0, blocked:0, duplicate:0, outOfWindow:0 };
 
-        all.forEach(msg => {
-            const messageText = msg.innerText.trim();
-            if (!messageText) { skipped.empty++; return; }
-            const sentByMe = msg.closest(".message-out") !== null;
-            const time = parseWhatsAppTime(msg);
-            if (!time) { skipped.invalidTime++; return; }
-            const senderNumber = getSenderNumber(msg);
-            if (senderNumber && blockedNumbers.has(senderNumber)) { skipped.blocked++; return; }
-            const dataId = msg.closest('[data-id]')?.getAttribute('data-id')
-                || `${messageText}-${time.toISOString()}-${sentByMe ? 'you' : 'them'}`;
-            if (sentMessages.has(dataId)) { skipped.duplicate++; return; }
-            sentMessages.add(dataId);
-            if (time >= twentyFourHoursAgo && time <= now) {
-                payloadList.push({
-                    email: currentEmail,
-                    phone: getPhoneNumber(),
-                    sender: senderNumber,
-                    idPeople: peopleId,
-                    messageId: dataId,
-                    dateTime: `${String(time.getDate()).padStart(2, '0')}/${String(time.getMonth()+1).padStart(2,'0')}/${time.getFullYear()} ${String(time.getHours()).padStart(2,'0')}:${String(time.getMinutes()).padStart(2,'0')}`,
-                    incoming: sentByMe ? 0 : 1,
-                    message: messageText
-                });
-            } else { skipped.outOfWindow++; }
-        });
+        for (const msg of all) {
+            const payload = await buildPayloadFromMessage(msg, now, twentyFourHoursAgo, skipped);
+            if (payload) payloadList.push(payload);
+        }
 
         log("INFO","CAPTURE",`Payload pronto: ${payloadList.length}`);
         log("DEBUG","CAPTURE","Estatísticas de descarte", skipped);
@@ -280,51 +401,37 @@ function captureMessages() {
         }
 
         observer = new MutationObserver(mutations => {
-            const now = new Date();
-            const twentyFourHoursAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
-            const payloadList = [];
-            const skipped = { empty:0, invalidTime:0, blocked:0, duplicate:0, outOfWindow:0 };
-            let seen = 0;
+            const processMutations = async () => {
+                const now = new Date();
+                const twentyFourHoursAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+                const payloadList = [];
+                const skipped = { empty:0, invalidTime:0, blocked:0, duplicate:0, outOfWindow:0 };
+                let seen = 0;
 
-            mutations.forEach(mutation => {
-                mutation.addedNodes.forEach(node => {
-                    if (node.nodeType !== 1) return;
-                    const msgs = node.querySelectorAll?.(".copyable-text[data-pre-plain-text]") || [];
-                    const elements = node.matches?.(".copyable-text[data-pre-plain-text]") ? [node] : msgs;
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        const elements = [];
+                        if (node.matches?.(".copyable-text[data-pre-plain-text]")) elements.push(node);
+                        if (node.querySelectorAll) {
+                            elements.push(...Array.from(node.querySelectorAll(".copyable-text[data-pre-plain-text]")));
+                        }
 
-                    elements.forEach(msg => {
-                        seen++;
-                        const messageText = msg.innerText.trim();
-                        if (!messageText) { skipped.empty++; return; }
-                        const sentByMe = msg.closest(".message-out") !== null;
-                        const time = parseWhatsAppTime(msg);
-                        if (!time) { skipped.invalidTime++; return; }
-                        const senderNumber = getSenderNumber(msg);
-                        if (senderNumber && blockedNumbers.has(senderNumber)) { skipped.blocked++; return; }
-                        const dataId = msg.closest('[data-id]')?.getAttribute('data-id')
-                            || `${messageText}-${time.toISOString()}-${sentByMe ? 'you' : 'them'}`;
-                        if (sentMessages.has(dataId)) { skipped.uplicate++; return; }
-                        sentMessages.add(dataId);
-                        if (time >= twentyFourHoursAgo && time <= now) {
-                            payloadList.push({
-                                email: currentEmail,
-                                phone: getPhoneNumber(),
-                                sender: senderNumber,
-                                idPeople: peopleId,
-                                messageId: dataId,
-                                dateTime: `${String(time.getDate()).padStart(2,'0')}/${String(time.getMonth()+1).padStart(2,'0')}/${time.getFullYear()} ${String(time.getHours()).padStart(2,'0')}:${String(time.getMinutes()).padStart(2,'0')}`,
-                                incoming: sentByMe ? 0 : 1,
-                                message: messageText
-                            });
-                        } else { skipped.outOfWindow++; }
-                    });
-                });
-            });
+                        for (const msg of elements) {
+                            seen++;
+                            const payload = await buildPayloadFromMessage(msg, now, twentyFourHoursAgo, skipped);
+                            if (payload) payloadList.push(payload);
+                        }
+                    }
+                }
 
-            log("INFO","OBSERVER",`Mutations processadas: ${seen} → payload ${payloadList.length}`);
-            log("DEBUG","OBSERVER","Estatísticas de descarte", skipped);
-            saveSentMessages(sentMessages);
-            if (payloadList.length > 0) sendBatchToAPI(payloadList);
+                log("INFO","OBSERVER",`Mutations processadas: ${seen} → payload ${payloadList.length}`);
+                log("DEBUG","OBSERVER","Estatísticas de descarte", skipped);
+                saveSentMessages(sentMessages);
+                if (payloadList.length > 0) sendBatchToAPI(payloadList);
+            };
+
+            processMutations().catch(error => log("ERROR","OBSERVER","Erro ao processar mutations", error));
         });
 
         observer.observe(root, { childList: true, subtree: true });
@@ -335,13 +442,13 @@ function captureMessages() {
     };
 
     // ======== CHAT CHANGE ========
-    const checkForChatChange = () => {
+    const checkForChatChange = async () => {
         const currentChat = getChatName();
         if (currentChat && currentChat !== lastChat) {
             log("INFO","CHAT",`Mudança de chat detectada: "${lastChat}" -> "${currentChat}"`);
             lastChat = currentChat;
             // roda direto sem depender de waitForChat
-            captureMessagesFromLast24Hours();
+            await captureMessagesFromLast24Hours();
             setupObserver();
         } else {
             log("VERBOSE","CHAT","Sem mudança de chat", { lastChat, currentChat });
@@ -356,11 +463,11 @@ function captureMessages() {
         log("INFO","INIT","Credenciais OK", { email: currentEmail, hasToken: !!lydiaToken });
 
         // dispara imediatamente (sem aguardar seletor específico)
-        captureMessagesFromLast24Hours();
+        await captureMessagesFromLast24Hours();
         setupObserver();
 
         // monitora troca de conversa
-        setInterval(checkForChatChange, 1000);
+        setInterval(() => { checkForChatChange(); }, 1000);
 
         // diagnósticos extras
         const { selector } = findChatContainer();
